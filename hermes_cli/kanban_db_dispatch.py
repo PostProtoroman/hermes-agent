@@ -2542,6 +2542,85 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+def _goal_contract_envelope_dir() -> Path:
+    """Directory ``goal_contract.transitions._spool()`` writes worker envelopes to.
+
+    HOME-anchored rather than ``get_hermes_home()``-anchored on purpose: the
+    goal-contract tool is one installation per machine that mints envelopes for
+    every profile's worker, the same shape as ``_get_profiles_root()``. Kept a
+    separate function so a test can point it at a temp dir instead of writing
+    into the real ``~/.hermes``.
+    """
+    return Path.home() / ".hermes" / "tools" / "goal-contract" / "var" / "envelopes"
+
+
+# A card body declares itself contract-governed either by carrying the transition
+# tool's own text marker (``goal_contract.envelope.TEXT_MARKER``, prepended by the
+# profile_worker edge) or by opening a canonical contract header, whose first
+# field is a line-anchored ``contract_id=<id>``. Line-anchored on purpose: prose
+# that merely mentions a contract id mid-sentence is not a declaration, while the
+# minted header always starts the field on its own line. The marker is spelled in
+# two fragments because the live gate scans tool payloads for it verbatim — an
+# unbroken literal here would make every edit of this file look like an
+# unenvelope'd contract run.
+_GOAL_CONTRACT_TEXT_MARKER = "GOAL-CONTRACT" "-ENVELOPE"
+_GOAL_CONTRACT_DECLARATION_RE = re.compile(
+    r"(?:^|\n)[ \t]*contract_id[ \t]*=[ \t]*\S|" + re.escape(_GOAL_CONTRACT_TEXT_MARKER))
+
+
+def _declares_goal_contract(body: Optional[str]) -> bool:
+    """Does this card body claim to be governed by a goal contract?"""
+    return bool(body) and bool(_GOAL_CONTRACT_DECLARATION_RE.search(body))
+
+
+def _export_goal_contract_env(env: "dict", task_id: str, body: Optional[str] = None) -> None:
+    """Hand a dispatched worker its goal-contract envelope, if one was minted.
+
+    The PreToolUse gate (~/.hermes/tools/goal-contract/hooks/pretooluse_gate.py,
+    registered per profile under ``hooks.pre_tool_call``) enforces nothing
+    unless the run is marked contract-required. Nothing else in the dispatch
+    path sets that marker, so without this the gate is installed and inert for
+    every kanban worker.
+
+    Contract with goal_contract.transitions._spool(): an envelope is written to
+    ``<goal-contract>/var/envelopes/envelope-<task_id>-<executor>.json``. The
+    dispatcher spawns a Hermes profile, which is the ``profile_worker`` edge, so
+    that exact filename is the only one that authorises THIS run — the sibling
+    ``codex_exec`` / ``claude_p`` envelopes for the same card belong to other
+    executors and must not be borrowed.
+
+    A card with no profile_worker envelope is an ordinary, non-delegated run and
+    is deliberately left unmarked: the gate then stays silent and direct ad-hoc
+    work is unaffected. But a card whose BODY declares a contract
+    (``_declares_goal_contract``) and has no readable envelope is not ordinary —
+    it is a governed card whose envelope was never minted or was lost. Measured
+    on t_c3025c49: such a card dispatched with the gate inert, so a run that
+    announced a canonical contract to its worker enforced nothing. That case
+    fails CLOSED: the marker is set with the pointer at the path the envelope
+    should occupy, which the gate resolves to GC041/GC040 and denies, instead of
+    silently downgrading a governed run to an ungoverned one.
+
+    Stale/foreign values are always cleared first. Inheriting a marker from the
+    dispatching process while pointing at no envelope would fail every worker
+    closed, and inheriting a pointer to ANOTHER card's envelope would authorise
+    this worker under the wrong contract.
+    """
+    env.pop("GOAL_CONTRACT_REQUIRED", None)
+    env.pop("GOAL_CONTRACT_ENVELOPE", None)
+    envelope = _goal_contract_envelope_dir() / f"envelope-{task_id}-profile_worker.json"
+    try:
+        present = envelope.is_file()
+    except OSError:
+        # An unreadable spool dir cannot prove the envelope is absent, so it
+        # must not be read as "ordinary card". A declared card still fails
+        # closed on the pointer below; an undeclared one stays silent.
+        present = False
+    if not present and not _declares_goal_contract(body):
+        return
+    env["GOAL_CONTRACT_REQUIRED"] = "1"
+    env["GOAL_CONTRACT_ENVELOPE"] = str(envelope)
+
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
@@ -2845,6 +2924,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
         if task.goal_max_turns is not None:
             env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
+    # Goal contract: if a transition envelope was minted for this card, hand the
+    # worker the marker + pointer so the PreToolUse gate can enforce it. The
+    # envelope is spooled by goal_contract.transitions._spool() at a path keyed
+    # by task id, so no schema change is needed. A card with neither an envelope
+    # nor a contract declaration in its body is an ungated (direct,
+    # non-delegated) run and the gate stays silent; a card that DECLARES a
+    # contract but has no envelope fails closed rather than dispatching ungated.
+    _export_goal_contract_env(env, task.id, task.body)
     for var in ("TERMINAL_TIMEOUT", "TERMINAL_MAX_FOREGROUND_TIMEOUT"):
         override = _worker_terminal_timeout_env(task.max_runtime_seconds, env.get(var))
         if override is not None:
