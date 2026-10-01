@@ -1436,7 +1436,7 @@ def _anthropic_catalog(normalized: str, force_refresh: bool) -> list[str]:
         return curated
     # The live /v1/models dump lags newly-routed curated aliases (reachable before enumerated):
     # curated first, then live-only extras, so a fresh curated model never disappears.
-    return live if cfg_base_url else _merge_unique(curated, live)
+    return live if cfg_base_url else _merge_unique(curated, live, key=lambda m: str(m).lower().replace(".", "-"))
 
 
 def _openai_catalog(normalized: str, force_refresh: bool) -> Optional[list[str]]:
